@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 from tqdm import tqdm
 
-from tensorboardX import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 import cv2
 import matplotlib.pyplot as plt
 
@@ -154,6 +154,60 @@ def draw_matches(rgb1, rgb2, match_pairs, lw = 0.5, color='g', if_fig=True,
         plt.show()
 
 
+def draw_matches_overlay(img1, img2, matches, color=(0, 255, 0), radius=2, thickness=1):
+    """Return an image showing ``img1`` and ``img2`` side by side with match lines.
+
+    Parameters
+    ----------
+    img1 : np.ndarray
+        First image in ``H x W`` or ``H x W x 3`` format.
+    img2 : np.ndarray
+        Second image in ``H x W`` or ``H x W x 3`` format.
+    matches : np.ndarray
+        Array of shape ``(N, 4)`` containing ``[x1, y1, x2, y2]`` pairs.
+    color : tuple, optional
+        BGR color of the lines.
+    radius : int, optional
+        Radius of circles drawn on match points.
+    thickness : int, optional
+        Line thickness.
+
+    Returns
+    -------
+    np.ndarray
+        Combined overlay image.
+    """
+
+    # Ensure both images are 3 channel BGR
+    img1 = img1.copy()
+    img2 = img2.copy()
+    if img1.ndim == 2:
+        img1 = cv2.cvtColor(img1, cv2.COLOR_GRAY2BGR)
+    if img2.ndim == 2:
+        img2 = cv2.cvtColor(img2, cv2.COLOR_GRAY2BGR)
+
+    h1, w1 = img1.shape[:2]
+    h2, w2 = img2.shape[:2]
+
+    # create canvas wide enough for both images
+    canvas = np.zeros((max(h1, h2), w1 + w2, 3), dtype=img1.dtype)
+    canvas[:h1, :w1] = img1
+    canvas[:h2, w1:w1 + w2] = img2
+
+    # draw each match as a line between the two images
+    for m in matches:
+        x1, y1, x2, y2 = map(int, m[:4])
+        pt1 = (x1, y1)
+        # second point is shifted by ``w1`` so that it aligns with ``img2``
+        pt2 = (x2 + w1, y2)
+        # draw connection line and endpoints for visualization
+        cv2.line(canvas, pt1, pt2, color, thickness)
+        cv2.circle(canvas, pt1, radius, color, -1)
+        cv2.circle(canvas, pt2, radius, color, -1)
+
+    return canvas
+
+
 
 # from utils.draw import draw_matches_cv
 def draw_matches_cv(data):
@@ -161,15 +215,16 @@ def draw_matches_cv(data):
     keypoints2 = [cv2.KeyPoint(p[1], p[0], 1) for p in data['keypoints2']]
     inliers = data['inliers'].astype(bool)
     matches = np.array(data['matches'])[inliers].tolist()
-    def to3dim(img):
-        if img.ndim == 2:
-            img = img[:, :, np.newaxis]
+    def ensure_color(img):
+        if img.ndim == 2 or (img.ndim == 3 and img.shape[2] == 1):
+            # Convert grayscale to BGR to avoid cv2.drawMatches errors
+            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         return img
-    img1 = to3dim(data['image1'])
-    img2 = to3dim(data['image2'])
-    img1 = np.concatenate([img1, img1, img1], axis=2)
-    img2 = np.concatenate([img2, img2, img2], axis=2)
-    return cv2.drawMatches(img1, keypoints1, img2, keypoints2, matches,
+    def to_uint8(img32):
+        return cv2.convertScaleAbs(img32, alpha=255.0)
+    img1 = ensure_color(data['image1'])
+    img2 = ensure_color(data['image2'])
+    return cv2.drawMatches(to_uint8(img1), keypoints1, to_uint8(img2), keypoints2, matches,
                            None, matchColor=(0,255,0), singlePointColor=(0, 0, 255))
 
 

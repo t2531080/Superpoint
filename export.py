@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 from imageio import imread
 from tqdm import tqdm
-from tensorboardX import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 
 ## torch
 import torch
@@ -35,7 +35,7 @@ from utils.utils import (
     load_checkpoint,
     save_path_formatter,
 )
-from utils.utils import getWriterPath
+from utils.utils import getWriterPath, flattenDetection
 from utils.loader import dataLoader, modelLoader, pretrainedLoader
 from utils.utils import inv_warp_image_batch
 from models.model_wrap import SuperPointFrontend_torch, PointTracker
@@ -65,7 +65,6 @@ def combine_heatmap(heatmap, inv_homographies, mask_2D, device="cpu"):
 
 
 #### end util functions
-
 
 def export_descriptor(config, output_dir, args):
     """
@@ -120,7 +119,12 @@ def export_descriptor(config, output_dir, args):
     ###### check!!!
     count = 0
     for i, sample in tqdm(enumerate(test_loader)):
-        img_0, img_1 = sample["image"], sample["warped_image"]
+        # HPatches samples already contain warped pairs while some datasets like
+        # Cityscapes might omit them. In the latter case use the original image
+        # and an identity homography.
+        img_0 = sample["image"]
+        img_1 = sample.get("warped_image", img_0)
+        has_warp = "warped_image" in sample
 
         # first image, no matches
         # img = img_0
@@ -151,31 +155,55 @@ def export_descriptor(config, output_dir, args):
         outs = get_pts_desc_from_agent(val_agent, img_0, device=device)
         pts, desc = outs["pts"], outs["desc"]  # pts: np [3, N]
 
-        if outputMatches == True:
+        # optional segmentation prediction
+        if args.export_segmentation and "segmentation" in val_agent.outs:
+            seg_pred = val_agent.outs["segmentation"].argmax(dim=1)
+            pred_mask = seg_pred.cpu().numpy().squeeze()
+        else:
+            pred_mask = None
+
+        if outputMatches and has_warp:
             tracker.update(pts, desc)
 
         # save keypoints
         pred = {"image": squeezeToNumpy(img_0)}
         pred.update({"prob": pts.transpose(), "desc": desc.transpose()})
+        if pred_mask is not None:
+            pred["pred_mask"] = pred_mask
+            if "segmentation_mask" in sample:
+                pred["gt_mask"] = squeezeToNumpy(sample["segmentation_mask"])
+            elif "mask" in sample:
+                pred["gt_mask"] = squeezeToNumpy(sample["mask"])
 
         # second image, output matches
         outs = get_pts_desc_from_agent(val_agent, img_1, device=device)
         pts, desc = outs["pts"], outs["desc"]
 
-        if outputMatches == True:
+        if outputMatches and has_warp:
             tracker.update(pts, desc)
 
         pred.update({"warped_image": squeezeToNumpy(img_1)})
-        # print("total points: ", pts.shape)
-        pred.update(
-            {
-                "warped_prob": pts.transpose(),
-                "warped_desc": desc.transpose(),
-                "homography": squeezeToNumpy(sample["homography"]),
-            }
-        )
+        # If the sample provides a warped pair, also store the corresponding
+        # keypoints, descriptors and homography
+        if has_warp:
+            pred.update(
+                {
+                    "warped_prob": pts.transpose(),
+                    "warped_desc": desc.transpose(),
+                }
+            )
+            if "homography" in sample:
+                pred["homography"] = squeezeToNumpy(sample["homography"])
 
-        if outputMatches == True:
+        if "segmentation_mask" in sample:
+            mask_np = squeezeToNumpy(sample["segmentation_mask"])
+            pred.update({"segmentation_mask": mask_np, "gt_mask": mask_np})
+        elif "mask" in sample:
+            mask_np = squeezeToNumpy(sample["mask"])
+            pred.update({"segmentation_mask": mask_np, "gt_mask": mask_np})
+
+
+        if outputMatches and has_warp:
             matches = tracker.get_matches()
             print("matches: ", matches.transpose().shape)
             pred.update({"matches": matches.transpose()})
@@ -190,6 +218,8 @@ def export_descriptor(config, output_dir, args):
         # print("save: ", path)
         count += 1
     print("output pairs: ", count)
+    # close tensorboard writer to avoid duplicate plugin errors
+    writer.close()
 
 
 @torch.no_grad()
@@ -203,6 +233,7 @@ def export_detector_homoAdapt_gpu(config, output_dir, args):
     from utils.utils import pltImshow
     from utils.utils import saveImg
     from utils.draw import draw_keypoints
+    from evaluation import overlay_mask, compute_miou
 
     # basic setting
     task = config["data"]["dataset"]
@@ -281,6 +312,14 @@ def export_detector_homoAdapt_gpu(config, output_dir, args):
 
     ## loop through all images
     for i, sample in tqdm(enumerate(test_loader)):
+        
+        if sample is None:
+            print(f"[WARN] Skipping None batch at index {i}")
+            continue
+
+        if "image" not in sample or "valid_mask" not in sample:
+            print(f"[WARN] Skipping invalid sample at index {i}")
+            continue
         img, mask_2D = sample["image"], sample["valid_mask"]
         img = img.transpose(0, 1)
         img_2D = sample["image_2D"].numpy().squeeze()
@@ -306,7 +345,15 @@ def export_detector_homoAdapt_gpu(config, output_dir, args):
                 continue
 
         # pass through network
-        heatmap = fe.run(img, onlyHeatmap=True, train=False)
+        with torch.no_grad():
+            outs_all = fe.net(img)
+        semi = outs_all["semi"]
+        heatmap = flattenDetection(semi, tensor=True)
+        if args.export_segmentation and "segmentation" in outs_all:
+            seg_pred = outs_all["segmentation"].argmax(dim=1)
+            pred_mask = seg_pred.cpu().numpy().squeeze()
+        else:
+            pred_mask = None
         outputs = combine_heatmap(heatmap, inv_homographies, mask_2D, device=device)
         pts = fe.getPtsFromHeatmap(outputs.detach().cpu().squeeze())  # (x,y, prob)
 
@@ -330,10 +377,44 @@ def export_detector_homoAdapt_gpu(config, output_dir, args):
         ## save keypoints
         pred = {}
         pred.update({"pts": pts})
+        if pred_mask is not None:
+            pred["pred_mask"] = pred_mask
+            if "segmentation_mask" in sample:
+                pred["gt_mask"] = np.squeeze(sample["segmentation_mask"])
+            elif "mask" in sample:
+                pred["gt_mask"] = np.squeeze(sample["mask"])
+        if "segmentation_mask" in sample:
+            pred.update({"segmentation_mask": np.squeeze(sample["segmentation_mask"])})
+        elif "mask" in sample:
+            pred.update({"segmentation_mask": np.squeeze(sample["mask"])})
+
+        # ----- TensorBoard visualization -----
+        # log image with predicted keypoints overlay
+        img_pts = draw_keypoints(img_2D * 255, pts.transpose())
+        writer.add_image(
+            "keypoints", torch.from_numpy(img_pts).permute(2, 0, 1) / 255.0, count
+        )
+
+        # log segmentation overlay and compute mIoU when available
+        if pred_mask is not None:
+            overlay = overlay_mask(
+                img_2D, pred_mask,
+                num_classes=config["data"].get("num_segmentation_classes")
+            )
+            writer.add_image(
+                "seg_overlay", torch.from_numpy(overlay).permute(2, 0, 1) / 255.0, count
+            )
+            if "gt_mask" in pred:
+                miou = compute_miou(pred_mask, pred["gt_mask"],
+                                   num_classes=config["data"].get("num_segmentation_classes"))
+                writer.add_scalar("mIoU", miou, count)
+        # number of detected points per image
+        writer.add_scalar("num_points", pts.shape[0], count)
 
         ## - make directories
         filename = str(name)
-        if task == "Kitti" or "Kitti_inh":
+        # only KITTI-like datasets provide a scene_name for grouping outputs
+        if task in ("Kitti", "Kitti_inh"):
             scene_name = sample["scene_name"][0]
             os.makedirs(Path(save_output, scene_name), exist_ok=True)
 
@@ -354,6 +435,8 @@ def export_detector_homoAdapt_gpu(config, output_dir, args):
     with open(save_file, "a") as myfile:
         myfile.write("Homography adaptation: " + str(homoAdapt_iter) + "\n")
         myfile.write("output pairs: " + str(count) + "\n")
+    # close tensorboard writer
+    writer.close()
     pass
 
 
@@ -379,6 +462,12 @@ if __name__ == "__main__":
     p_train.add_argument(
         "--debug", action="store_true", default=False, help="turn on debuging mode"
     )
+    p_train.add_argument(
+        "--export-segmentation",
+        action="store_true",
+        default=False,
+        help="save predicted segmentation masks",
+    )
     p_train.set_defaults(func=export_descriptor)
 
     # using homography adaptation to export detection psuedo ground truth
@@ -392,12 +481,18 @@ if __name__ == "__main__":
     p_train.add_argument(
         "--debug", action="store_true", default=False, help="turn on debuging mode"
     )
+    p_train.add_argument(
+        "--export-segmentation",
+        action="store_true",
+        default=False,
+        help="save predicted segmentation masks",
+    )
     # p_train.set_defaults(func=export_detector_homoAdapt)
     p_train.set_defaults(func=export_detector_homoAdapt_gpu)
 
     args = parser.parse_args()
     with open(args.config, "r") as f:
-        config = yaml.load(f)
+        config = yaml.safe_load(f)
     print("check config!! ", config)
 
     output_dir = os.path.join(EXPER_PATH, args.exper_name)

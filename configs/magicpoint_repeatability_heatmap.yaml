@@ -1,5 +1,5 @@
 data:
-    name: 'patches_dataset'
+    name: 'Hpatches_dataset'
     dataset: 'hpatches'  # 'coco' 'hpatches'
     alteration: 'all'  # 'all' 'i' 'v'
     preprocessing:
@@ -13,6 +13,9 @@ model:
     name: 'SuperPointNet_gauss2' # SuperPointNet_heatmap
     params: {
     }
+
+    lambda_segmentation: 1.0
+    num_segmentation_classes: 34
 
     # learning_rate: 0.0001 # 0.0001
     detection_threshold: 0.015 # 0.015
@@ -36,8 +39,8 @@ model:
     # pretrained: 'logs/superpoint_kitti_heat2_0/checkpoints/superPointNet_50000_checkpoint.pth.tar'
     # pretrained: 'logs/superpoint_spollo_v0/checkpoints/superPointNet_40000_checkpoint.pth.tar'
     # pretrained: 'logs/superpoint_coco/checkpoints/superPointNet_180_checkpoint.pth.tar'
-    pretrained: 'logs/superpoint_coco_heat2_0/checkpoints/superPointNet_170000_checkpoint.pth.tar'
+    pretrained: 'logs/superpoint_coco/checkpoints/superPointNet_9000_checkpoint.pth.tar'
 
 
 
-eval_iter: 1000
+eval_iter: 100

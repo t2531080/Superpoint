@@ -14,7 +14,7 @@ import torch
 import torch.optim
 import torch.utils.data
 
-from tensorboardX import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 
 # from utils.utils import tensor2array, save_checkpoint, load_checkpoint, save_path_formatter
 from utils.utils import getWriterPath
@@ -22,7 +22,7 @@ from settings import EXPER_PATH
 
 ## loaders: data, model, pretrained model
 from utils.loader import dataLoader, modelLoader, pretrainedLoader
-from utils.logging import *
+from utils.custom_logging import *
 # from models.model_wrap import SuperPointFrontend_torch, PointTracker
 
 ###### util functions ######
@@ -95,6 +95,8 @@ def train_joint(config, output_dir, args):
         print ("press ctrl + c, save model!")
         train_agent.saveModel()
         pass
+    # close tensorboard writer to prevent duplicate plugin registration
+    writer.close()
 
 if __name__ == '__main__':
     # global var

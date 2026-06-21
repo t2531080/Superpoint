@@ -2,7 +2,7 @@ data:
     dataset: 'Coco'  # 'coco' 'hpatches'
     export_folder: 'train' # train, val
     preprocessing:
-        resize: [240, 320] 
+        resize: [240, 320]  # [480, 640]  # images are downsampled for training
         # resize: [480, 640] 
     gaussian_label:
         enable: false # false
@@ -12,7 +12,7 @@ data:
             enable: false
     homography_adaptation:
         enable: true
-        num: 100 # 100
+        num: 10 # 100
         aggregation: 'sum'
         filter_counts: 0
         homographies:
@@ -28,15 +28,17 @@ data:
                 patch_ratio: 0.85
 
 training:
-    workers_test: 2
+    workers_train: 16
+    workers_val: 8
+    workers_test: 8
 
 model:
     # name: 'SuperPointNet' # 'SuperPointNet_gauss2'
     name: 'SuperPointNet_gauss2' # 'SuperPointNet_gauss2'
     params: {
     }    
-    batch_size: 1
-    eval_batch_size: 1
+    batch_size: 128
+    eval_batch_size: 8
     detection_threshold: 0.015 # 0.015
     nms: 4
     top_k: 600
@@ -44,6 +46,6 @@ model:
         enable: true
 
 # pretrained: 'logs/magicpoint_synth20/checkpoints/superPointNet_200000_checkpoint.pth.tar' # 'SuperPointNet'
-pretrained: 'logs/magicpoint_synth_t2/checkpoints/superPointNet_100000_checkpoint.pth.tar'
+pretrained: 'logs/magicpoint_synth/checkpoints/superPointNet_100000_checkpoint.pth.tar' # Newer version with 100k iterations
 
 

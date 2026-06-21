@@ -1,21 +1,30 @@
-# torch >= 0.4.1
-# torchvision
+--extra-index-url https://download.pytorch.org/whl/cu128
+
 argparse
 scipy
-opencv-python==3.4.2.16
-opencv-contrib-python==3.4.2.16
+opencv-python
+opencv-contrib-python
 matplotlib
+segmentation-models-pytorch
 imageio
 tqdm
-tensorflow==1.14.0
-tensorboardX
+tensorflow[and-cuda]
+tensorboard
+streamlit
+plotly
+# torch.utils.tensorboard
 tqdm
 pyyaml
 imageio
 imgaug
 jupyter
 scikit-learn
-
-torchgeometry
-torchsummary
+pandas
+numpy==1.26.4
+pycocotools
+torchinfo
+kornia
 coloredlogs
+tensorflow-addons
+panopticapi @ git+https://github.com/cocodataset/panopticapi.git
+

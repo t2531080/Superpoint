@@ -1,0 +1,15 @@
+datasets/kitti_split/
+datasets/tum_split/
+datasets/synthetic_shapes_v6/
+datasets/kitti/
+datasets/HPatches/
+__pycache__
+datasets/COCO/
+datasets/draw_*
+datasets/gaussian_noise/
+runs/
+logs/
+notebooks/
+pretrained/
+datasets/Cityscapes/
+sequence_demo_output/

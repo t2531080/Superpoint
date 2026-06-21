@@ -1,0 +1,64 @@
+# Configuration for exporting SuperPoint predictions on the Cityscapes dataset
+# This loads the fine-tuned model and writes predictions for the "val" split
+
+data:
+    name: 'Cityscapes'
+    dataset: 'Cityscapes'            # dataset name
+    alteration: 'all'                # 'all' 'i' 'v'
+    export_folder: 'val'             # choose split
+    root: 'datasets/Cityscapes'      # path to Cityscapes images
+    segmentation_labels: 'datasets/Cityscapes/gtFine_1024'  # downscaled masks
+    preprocessing:
+        resize: [512, 1024]  # match training resolution
+    reduce_to_4_categories: true
+    # generate a warped image pair similar to the training setup
+    warped_pair:
+        enable: true
+        params:
+            translation: false
+            rotation: true
+            scaling: true
+            perspective: false
+            scaling_amplitude: 0.03
+            perspective_amplitude_x: 0.01
+            perspective_amplitude_y: 0.01
+            patch_ratio: 0.9
+            allow_artifacts: true
+        valid_border_margin: 4
+training:
+    workers_train: 16
+    workers_val: 4
+    workers_test: 4
+
+# model used for exporting
+front_end_model: 'Val_model_heatmap'  # 'Train_model_frontend'
+
+model:
+    name: 'SuperPointNet_gauss2'
+    params: {}
+    lambda_segmentation: 1.0
+    num_segmentation_classes: 4
+
+    # learning_rate: 0.0001 # 0.0001
+    batch_size: 32
+    eval_batch_size: 32
+    # output parameters
+    learning_rate: 0.001
+    detection_threshold: 0.005 # 0.001
+    nms: 4
+    top_k: 500
+    nn_thresh: 0.7 # 0.7
+    homography_adaptation:
+        num: 0
+    subpixel:
+        enable: true
+        patch_size: 5
+    rand_noise:
+        enable: false
+        sigma: 0.2
+    # Path to the fine-tuned checkpoint to load before export
+    pretrained: 'logs/superpoint_cityscapes/checkpoints/superPointNet_50000_checkpoint.pth.tar'
+
+# evaluate only once
+eval_iter: 50
+

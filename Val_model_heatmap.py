@@ -34,6 +34,10 @@ class Val_model_heatmap(SuperPointFrontend_torch):
         self.config = config
         self.model = self.config['name']
         self.params = self.config['params']
+        # optional segmentation: ensure model has correct output channels
+        self.num_segmentation_classes = self.config.get('num_segmentation_classes', 0)
+        if self.num_segmentation_classes > 0 and 'num_classes' not in self.params:
+            self.params['num_classes'] = self.num_segmentation_classes
         self.weights_path = self.config['pretrained']
         self.device=device
 
@@ -66,9 +70,29 @@ class Val_model_heatmap(SuperPointFrontend_torch):
 
         checkpoint = torch.load(self.weights_path,
                                 map_location=lambda storage, loc: storage)
-        self.net.load_state_dict(checkpoint['model_state_dict'])
-
+        try:
+            self.net.load_state_dict(checkpoint["model_state_dict"])
+        except RuntimeError as err:
+            # add more context when segmentation classes mismatch
+            ckpt_classes = (
+                checkpoint["model_state_dict"].get("seg_head.3.weight")
+                .shape[0]
+                if "seg_head.3.weight" in checkpoint["model_state_dict"]
+                else "unknown"
+            )
+            model_classes = (
+                self.net.seg_head[-1].out_channels
+                if hasattr(self.net, "seg_head") else "unknown"
+            )
+            raise RuntimeError(
+                f"Could not load model weights: {err}\n"
+                f"Checkpoint segmentation classes: {ckpt_classes}, "
+                f"model expects: {model_classes}. "
+                "Ensure 'num_segmentation_classes' matches the training setup."
+            ) from err
         self.net = self.net.to(self.device)
+        # ensure evaluation mode so batch norm layers use stored statistics
+        self.net.eval()
         logging.info('successfully load pretrained model from: %s', self.weights_path)
         pass
 

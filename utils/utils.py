@@ -233,6 +233,8 @@ def warpLabels(pnts, homography, H, W):
     homography = torch.tensor(homography, dtype=torch.float32)
     warped_pnts = warp_points(torch.stack((pnts[:, 0], pnts[:, 1]), dim=1),
                               homography)  # check the (x, y)
+    warped_pnts[:, 0] = torch.clamp(warped_pnts[:, 0], 0, W - 1)
+    warped_pnts[:, 1] = torch.clamp(warped_pnts[:, 1], 0, H - 1)
     warped_pnts = filter_points(warped_pnts, torch.tensor([W, H])).round().long()
     return warped_pnts.numpy()
 
@@ -898,7 +900,7 @@ def getWriterPath(task='train', exper_name='', date=True):
     if exper_name != '':
         exper_name += '_'
     if date:
-        str_date_time = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
+        str_date_time = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     return prefix + task + '/' + exper_name + str_date_time
 
 def crop_or_pad_choice(in_num_points, out_num_points, shuffle=False):
@@ -917,6 +919,8 @@ def crop_or_pad_choice(in_num_points, out_num_points, shuffle=False):
     else:
         choice = np.arange(in_num_points)
     assert out_num_points > 0, 'out_num_points = %d must be positive int!'%out_num_points
+    # print(f"[DEBUG] [crop_or_pad_choice] in_num_points: {in_num_points}, out_num_points: {out_num_points}")
+    # print(f"[DEBUG] [crop_or_pad_choice] choice array before padding: {choice}")
     if in_num_points >= out_num_points:
         choice = choice[:out_num_points]
     else:

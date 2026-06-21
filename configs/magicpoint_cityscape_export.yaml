@@ -1,0 +1,55 @@
+data:
+    dataset: 'Cityscapes'  # 'coco' 'hpatches'
+    export_folder: 'val' # train, val
+    preprocessing:
+        resize: [512, 1024] 
+        # resize: [480, 640] 
+    gaussian_label:
+        enable: false # false
+        sigma: 1.
+    augmentation:
+        photometric:
+            enable: false
+        homographic:
+            enable: false
+            valid_border_margin: 3
+    homography_adaptation:
+        enable: true
+        num: 10 # 100
+        aggregation: 'sum'
+        filter_counts: 0
+        homographies:
+            params:
+                translation: true
+                rotation: true
+                scaling: true
+                perspective: false
+                scaling_amplitude: 0.2
+                perspective_amplitude_x: 0.2
+                perspective_amplitude_y: 0.2
+                allow_artifacts: true
+                patch_ratio: 0.85
+    warped_pair:
+           enable: false
+
+training:
+    workers_train: 16
+    workers_val: 2
+    workers_test: 2
+
+model:
+    # name: 'SuperPointNet' # 'SuperPointNet_gauss2'
+    name: 'SuperPointNet_gauss2' # 'SuperPointNet_gauss2'
+    params: {
+    }    
+    batch_size: 64
+    eval_batch_size: 6
+    detection_threshold: 0.015 # 0.015
+    nms: 4
+    top_k: 600
+    subpixel:
+        enable: true
+
+# pretrained: 'logs/magicpoint_synth20/checkpoints/superPointNet_200000_checkpoint.pth.tar' # 'SuperPointNet'
+# pretrained: 'logs/magicpoint_synth_t2/checkpoints/superPointNet_100000_checkpoint.pth.tar' # Newer version with 100k iterations
+pretrained: 'logs/magicpoint_synth/checkpoints/superPointNet_10000_checkpoint.pth.tar' # train with 20K iterations

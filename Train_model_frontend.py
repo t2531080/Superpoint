@@ -24,6 +24,8 @@ from utils.utils import labels2Dto3D, flattenDetection, labels2Dto3D_flattened
 from utils.utils import pltImshow, saveImg
 from utils.utils import precisionRecall_torch
 from utils.utils import save_checkpoint
+from torch.cuda.amp import autocast, GradScaler  # AMP utilities
+from contextlib import nullcontext
 
 from pathlib import Path
 
@@ -63,7 +65,15 @@ class Train_model_frontend(object):
         "train_iter": 170000,
         "save_interval": 2000,
         "tensorboard_interval": 200,
-        "model": {"subpixel": {"enable": False}},
+        "model": {
+            "subpixel": {"enable": False},
+            "lambda_segmentation": 1.0,  # weight of optional segmentation loss
+            "num_segmentation_classes": 0,  # number of classes for segmentation head
+        },
+        # Mixed precision training options
+        "amp": False,
+        "amp_dtype": "fp16",
+        "grad_scaler": {"enabled": True, "init_scale": 65536, "growth_interval": 2000},
     }
 
     def __init__(self, config, save_path=Path("."), device="cpu", verbose=False):
@@ -95,6 +105,21 @@ class Train_model_frontend(object):
         self.cell_size = 8
         self.subpixel = False
         self.loss = 0
+        self.lambda_segmentation = self.config["model"]["lambda_segmentation"]
+        self.num_segmentation_classes = self.config["model"]["num_segmentation_classes"]
+
+        # automatic mixed precision settings
+        self.use_amp = self.config.get("amp", False)
+        dtype = self.config.get("amp_dtype", "fp16")
+        self.amp_dtype = torch.float16 if dtype == "fp16" else torch.bfloat16
+        gs_conf = self.config.get("grad_scaler", {})
+        if self.use_amp and gs_conf.get("enabled", True):
+            self.grad_scaler = GradScaler(
+                init_scale=gs_conf.get("init_scale", 65536),
+                growth_interval=gs_conf.get("growth_interval", 2000),
+            )
+        else:
+            self.grad_scaler = None
 
         self.max_iter = config["train_iter"]
 
@@ -143,6 +168,8 @@ class Train_model_frontend(object):
 
         print("learning_rate: ", self.config["model"]["learning_rate"])
         print("lambda_loss: ", self.config["model"]["lambda_loss"])
+        print("lambda_segmentation: ", self.config["model"]["lambda_segmentation"])
+        print("num_segmentation_classes: ", self.config["model"]["num_segmentation_classes"])
         print("detection_threshold: ", self.config["model"]["detection_threshold"])
         print("batch_size: ", self.config["model"]["batch_size"])
 
@@ -186,10 +213,13 @@ class Train_model_frontend(object):
         """
         model = self.config["model"]["name"]
         params = self.config["model"]["params"]
+        if self.num_segmentation_classes > 0 and "num_classes" not in params:
+            params["num_classes"] = self.num_segmentation_classes
         print("model: ", model)
         net = modelLoader(model=model, **params).to(self.device)
         logging.info("=> setting adam solver")
         optimizer = self.adamOptim(net, lr=self.config["model"]["learning_rate"])
+
 
         n_iter = 0
         ## new model or load pretrained
@@ -396,24 +426,26 @@ class Train_model_frontend(object):
         # zero the parameter gradients
         self.optimizer.zero_grad()
 
-        # forward + backward + optimize
+        # forward + loss computation under AMP context
         if train:
-            # print("img: ", img.shape, ", img_warp: ", img_warp.shape)
-            outs, outs_warp = (
-                self.net(img.to(self.device)),
-                self.net(img_warp.to(self.device), subpixel=self.subpixel),
-            )
-            semi, coarse_desc = outs[0], outs[1]
-            semi_warp, coarse_desc_warp = outs_warp[0], outs_warp[1]
-        else:
-            with torch.no_grad():
+            amp_ctx = autocast(dtype=self.amp_dtype) if self.use_amp else nullcontext()
+            with amp_ctx:
                 outs, outs_warp = (
                     self.net(img.to(self.device)),
                     self.net(img_warp.to(self.device), subpixel=self.subpixel),
                 )
                 semi, coarse_desc = outs[0], outs[1]
                 semi_warp, coarse_desc_warp = outs_warp[0], outs_warp[1]
-                pass
+        else:
+            with torch.no_grad():
+                amp_ctx = autocast(dtype=self.amp_dtype) if self.use_amp else nullcontext()
+                with amp_ctx:
+                    outs, outs_warp = (
+                        self.net(img.to(self.device)),
+                        self.net(img_warp.to(self.device), subpixel=self.subpixel),
+                    )
+                    semi, coarse_desc = outs[0], outs[1]
+                    semi_warp, coarse_desc_warp = outs_warp[0], outs_warp[1]
 
         # detector loss
         ## get labels, masks, loss for detection
@@ -448,6 +480,8 @@ class Train_model_frontend(object):
             mat_H,
             mask_valid=mask_desc,
             device=self.device,
+            writer=self.writer,
+            global_step=n_iter,
             **self.desc_params
         )
 
@@ -541,8 +575,13 @@ class Train_model_frontend(object):
         # print("losses: ", losses)
 
         if train:
-            loss.backward()
-            self.optimizer.step()
+            if self.grad_scaler is not None:
+                self.grad_scaler.scale(loss).backward()
+                self.grad_scaler.step(self.optimizer)
+                self.grad_scaler.update()
+            else:
+                loss.backward()
+                self.optimizer.step()
 
         self.addLosses2tensorboard(losses, task)
         if n_iter % tb_interval == 0 or task == "val":
@@ -744,7 +783,10 @@ class Train_model_frontend(object):
         """
         for element in list(losses):
             # print ('add to tb: ', element)
-            print(task, "-", element, ": ", losses[element].item())
+            if element in ['miou','pixel_acc','class_acc']:
+                print(task, "-", element, ": ", losses[element])
+            else:
+                print(task, "-", element, ": ", losses[element].item())
 
     def add2tensorboard_nms(self, img, labels_2D, semi, task="training", batch_size=1):
         """
@@ -774,13 +816,13 @@ class Train_model_frontend(object):
             pts_nms = getPtsFromHeatmap(semi_thd, conf_thresh, nms_dist)
             semi_thd_nms_sample = np.zeros_like(semi_thd)
             semi_thd_nms_sample[
-                pts_nms[1, :].astype(np.int), pts_nms[0, :].astype(np.int)
+                pts_nms[1, :].astype(np.int64), pts_nms[0, :].astype(np.int64)
             ] = 1
 
             label_sample = torch.squeeze(labels_2D[idx, :, :, :])
             # pts_nms = getPtsFromHeatmap(label_sample.numpy(), conf_thresh, nms_dist)
             # label_sample_rms_sample = np.zeros_like(label_sample.numpy())
-            # label_sample_rms_sample[pts_nms[1, :].astype(np.int), pts_nms[0, :].astype(np.int)] = 1
+            # label_sample_rms_sample[pts_nms[1, :].astype(np.int64), pts_nms[0, :].astype(np.int64)] = 1
             label_sample_nms_sample = label_sample
 
             if idx < 5:

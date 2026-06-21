@@ -6,6 +6,9 @@ data:
     cache_in_memory: true
     suffix: 'v6'
     add_augmentation_to_test_set: false  # set to true to evaluate with noise
+    load_segmentation: false
+    reduce_to_4_categories: false
+    num_segmentation_classes: 0
     gaussian_label:
         enable: false
         params:
@@ -64,6 +67,11 @@ data:
 
 front_end_model: 'Train_model_heatmap'  # 'Train_model_frontend'
 
+training:
+    workers_train: 16
+    workers_val: 8
+    workers_test: 8
+
 model:
     name: 'SuperPointNet_gauss2'
     params: {
@@ -71,13 +79,16 @@ model:
     detector_loss:
         loss_type: 'softmax'
 
-    batch_size:  64 # 64
-    eval_batch_size: 16
+    batch_size:  8 # 64
+    eval_batch_size: 8
     learning_rate: 0.001
     kernel_reg: 0.
     detection_threshold: 0.001 # 1/65
     nms: 4
     lambda_loss: 0 # disable descriptor loss
+    lambda_segmentation: 0 # disable segmentation loss
+    compute_miou: false
+    num_segmentation_classes: 0
     dense_loss:
         enable: false
         params:
@@ -96,10 +107,10 @@ model:
 retrain: True # set true for new model
 reset_iter: True
 
-train_iter: 200000 # 200000
+train_iter: 100000 # 200000
 tensorboard_interval: 1000 # 200
-save_interval: 2000 # 2000
-validation_interval: 1000 # one validation of entire val set every N training steps
+save_interval: 1000 # 2000
+validation_interval: 500 # one validation of entire val set every N training steps
 validation_size: 10
 train_show_interval: 1000 # one show of the current training from to Tensorboard every N training steps
 seed: 0

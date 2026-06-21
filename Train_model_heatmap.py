@@ -17,6 +17,10 @@ import torch.utils.data
 import logging
 
 from utils.tools import dict_update
+from evaluation import overlay_mask  # for visualizing segmentation
+from evaluation import compute_miou  # mIoU computation utility
+from torch.cuda.amp import autocast, GradScaler  # AMP utilities
+from contextlib import nullcontext
 
 # from utils.utils import labels2Dto3D, flattenDetection, labels2Dto3D_flattened
 # from utils.utils import pltImshow, saveImg
@@ -25,6 +29,8 @@ from utils.utils import precisionRecall_torch
 
 from pathlib import Path
 from Train_model_frontend import Train_model_frontend
+
+from segmentation_models_pytorch.losses import DiceLoss
 
 
 def thd_img(img, thd=0.015):
@@ -61,8 +67,16 @@ class Train_model_heatmap(Train_model_frontend):
         "train_iter": 170000,
         "save_interval": 2000,
         "tensorboard_interval": 200,
-        "model": {"subpixel": {"enable": False}},
+        # model settings with default segmentation metric disabled
+        "model": {
+            "subpixel": {"enable": False},
+            "compute_miou": False,
+        },
         "data": {"gaussian_label": {"enable": False}},
+        # Mixed precision training options
+        "amp": False,
+        "amp_dtype": "fp16",
+        "grad_scaler": {"enabled": True, "init_scale": 65536, "growth_interval": 2000},
     }
 
     def __init__(self, config, save_path=Path("."), device="cpu", verbose=False):
@@ -81,8 +95,25 @@ class Train_model_heatmap(Train_model_frontend):
         self._eval = True
         self.cell_size = 8
         self.subpixel = False
-
+        self.lambda_segmentation = self.config["model"].get("lambda_segmentation", 1.0)
+        self.num_segmentation_classes = self.config["model"].get("num_segmentation_classes", 0)
+        # optional computation of segmentation mIoU per batch
+        self.compute_miou = self.config["model"].get("compute_miou", False)
+        self.seg_loss_fn = DiceLoss(mode='multiclass', from_logits=True)
         self.max_iter = config["train_iter"]
+
+        # automatic mixed precision settings
+        self.use_amp = self.config.get("amp", False)
+        dtype = self.config.get("amp_dtype", "fp16")
+        self.amp_dtype = torch.float16 if dtype == "fp16" else torch.bfloat16
+        gs_conf = self.config.get("grad_scaler", {})
+        if self.use_amp and gs_conf.get("enabled", True):
+            self.grad_scaler = GradScaler(
+                init_scale=gs_conf.get("init_scale", 65536),
+                growth_interval=gs_conf.get("growth_interval", 2000),
+            )
+        else:
+            self.grad_scaler = None
 
         self.gaussian = False
         if self.config["data"]["gaussian_label"]["enable"]:
@@ -165,8 +196,13 @@ class Train_model_heatmap(Train_model_frontend):
             loss_func = nn.MSELoss(reduction="mean")
             loss = loss_func(input, target)
         elif loss_type == "softmax":
-            loss_func_BCE = nn.BCELoss(reduction='none').cuda()
-            loss = loss_func_BCE(nn.functional.softmax(input, dim=1), target)
+            # BCELoss requires input and target to share the same dtype; when
+            # using mixed precision ``input`` may be half while ``target`` is
+            # float. Cast target to input dtype to avoid type mismatch errors.
+            loss_func_BCE = nn.BCELoss(reduction="none").cuda()
+            pred = nn.functional.softmax(input, dim=1)
+            target = target.to(pred.dtype)
+            loss = loss_func_BCE(pred, target)
             loss = (loss.sum(dim=1) * mask).sum()
             loss = loss / (mask.sum() + 1e-10)
         return loss
@@ -183,16 +219,27 @@ class Train_model_heatmap(Train_model_frontend):
 
         task = "train" if train else "val"
         tb_interval = self.config["tensorboard_interval"]
-        if_warp = self.config['data']['warped_pair']['enable']
 
         self.scalar_dict, self.images_dict, self.hist_dict = {}, {}, {}
         ## get the inputs
         # logging.info('get input img and label')
-        img, labels_2D, mask_2D = (
-            sample["image"],
-            sample["labels_2D"],
-            sample["valid_mask"],
+        img = sample["image"]
+        # keypoint labels may be absent when fine-tuning on Cityscapes
+        labels_2D = sample.get("labels_2D")
+        mask_2D = sample.get("valid_mask")
+
+        has_kpt_labels = labels_2D is not None
+
+        # enable warping when the dataset provides a warped pair. Some datasets
+        # use the key 'warped_image' instead of 'warped_img'.
+        if_warp = (
+            self.config['data']['warped_pair']['enable']
+            and ('warped_img' in sample or 'warped_image' in sample)
         )
+
+        # provide default mask if dataset doesn't supply one
+        if mask_2D is None:
+            mask_2D = torch.ones_like(img[:, :1, :, :])
         # img, labels = img.to(self.device), labels_2D.to(self.device)
 
         # variables
@@ -208,84 +255,95 @@ class Train_model_heatmap(Train_model_frontend):
         #     sample['warped_labels'].to(self.device), \
         #     sample['warped_valid_mask'].to(self.device)
         if if_warp:
-            img_warp, labels_warp_2D, mask_warp_2D = (
-                sample["warped_img"],
-                sample["warped_labels"],
-                sample["warped_valid_mask"],
-            )
+            img_warp = sample.get("warped_img", sample.get("warped_image"))
+            labels_warp_2D = sample.get("warped_labels")
+            mask_warp_2D = sample.get("warped_valid_mask", mask_2D)
 
         # homographies
         # mat_H, mat_H_inv = \
         # sample['homographies'].to(self.device), sample['inv_homographies'].to(self.device)
         if if_warp:
-            mat_H, mat_H_inv = sample["homographies"], sample["inv_homographies"]
+            mat_H = sample.get("homographies")
+            if mat_H is None:
+                mat_H = sample.get("homography")
+                if mat_H is not None:
+                    mat_H = mat_H.unsqueeze(0)
+            mat_H_inv = sample.get("inv_homographies")
+            if mat_H_inv is None and mat_H is not None:
+                mat_H_inv = torch.inverse(mat_H)
 
         # zero the parameter gradients
         self.optimizer.zero_grad()
 
-        # forward + backward + optimize
+        # forward pass under autocast
         if train:
-            # print("img: ", img.shape, ", img_warp: ", img_warp.shape)
-            outs = self.net(img.to(self.device))
-            semi, coarse_desc = outs["semi"], outs["desc"]
-            if if_warp:
-                outs_warp = self.net(img_warp.to(self.device))
-                semi_warp, coarse_desc_warp = outs_warp["semi"], outs_warp["desc"]
-        else:
-            with torch.no_grad():
+            amp_ctx = autocast(dtype=self.amp_dtype) if self.use_amp else nullcontext()
+            with amp_ctx:
                 outs = self.net(img.to(self.device))
                 semi, coarse_desc = outs["semi"], outs["desc"]
+                seg_pred = outs.get("segmentation")
                 if if_warp:
                     outs_warp = self.net(img_warp.to(self.device))
                     semi_warp, coarse_desc_warp = outs_warp["semi"], outs_warp["desc"]
-                pass
+        else:
+            with torch.no_grad():
+                amp_ctx = autocast(dtype=self.amp_dtype) if self.use_amp else nullcontext()
+                with amp_ctx:
+                    outs = self.net(img.to(self.device))
+                    semi, coarse_desc = outs["semi"], outs["desc"]
+                    seg_pred = outs.get("segmentation")
+                    if if_warp:
+                        outs_warp = self.net(img_warp.to(self.device))
+                        semi_warp, coarse_desc_warp = outs_warp["semi"], outs_warp["desc"]
 
-        # detector loss
+        # detector loss -- skip when no keypoint labels are available
         from utils.utils import labels2Dto3D
 
-        if self.gaussian:
-            labels_2D = sample["labels_2D_gaussian"]
-            if if_warp:
-                warped_labels = sample["warped_labels_gaussian"]
-        else:
-            labels_2D = sample["labels_2D"]
-            if if_warp:
-                warped_labels = sample["warped_labels"]
-
-        add_dustbin = False
-        if det_loss_type == "l2":
-            add_dustbin = False
-        elif det_loss_type == "softmax":
-            add_dustbin = True
-
-        labels_3D = labels2Dto3D(
-            labels_2D.to(self.device), cell_size=self.cell_size, add_dustbin=add_dustbin
-        ).float()
         mask_3D_flattened = self.getMasks(mask_2D, self.cell_size, device=self.device)
-        loss_det = self.detector_loss(
-            input=outs["semi"],
-            target=labels_3D.to(self.device),
-            mask=mask_3D_flattened,
-            loss_type=det_loss_type,
-        )
-        # warp
-        if if_warp:
+
+        if has_kpt_labels:
+            if self.gaussian:
+                labels_2D = sample.get("labels_2D_gaussian", labels_2D)
+                if if_warp:
+                    warped_labels = sample.get("warped_labels_gaussian")
+            else:
+                labels_2D = labels_2D
+                if if_warp:
+                    warped_labels = labels_warp_2D
+
+            add_dustbin = det_loss_type == "softmax"
+
             labels_3D = labels2Dto3D(
-                warped_labels.to(self.device),
-                cell_size=self.cell_size,
-                add_dustbin=add_dustbin,
+                labels_2D.to(self.device), cell_size=self.cell_size, add_dustbin=add_dustbin
             ).float()
-            mask_3D_flattened = self.getMasks(
-                mask_warp_2D, self.cell_size, device=self.device
-            )
-            loss_det_warp = self.detector_loss(
-                input=outs_warp["semi"],
+            loss_det = self.detector_loss(
+                input=outs["semi"],
                 target=labels_3D.to(self.device),
                 mask=mask_3D_flattened,
                 loss_type=det_loss_type,
             )
+
+            if if_warp and warped_labels is not None:
+                labels_3D = labels2Dto3D(
+                    warped_labels.to(self.device),
+                    cell_size=self.cell_size,
+                    add_dustbin=add_dustbin,
+                ).float()
+                mask_3D_flattened = self.getMasks(
+                    mask_warp_2D, self.cell_size, device=self.device
+                )
+                loss_det_warp = self.detector_loss(
+                    input=outs_warp["semi"],
+                    target=labels_3D.to(self.device),
+                    mask=mask_3D_flattened,
+                    loss_type=det_loss_type,
+                )
+            else:
+                loss_det_warp = torch.tensor(0.0, device=self.device)
         else:
-            loss_det_warp = torch.tensor([0]).float().to(self.device)
+            # no supervision available
+            loss_det = torch.tensor(0.0, device=self.device)
+            loss_det_warp = torch.tensor(0.0, device=self.device)
 
 
         ## get labels, masks, loss for detection
@@ -304,8 +362,7 @@ class Train_model_heatmap(Train_model_frontend):
         # print("mask_warp_2D: ", mask_warp_2D.shape)
 
         # descriptor loss
-        if lambda_loss > 0:
-            assert if_warp == True, "need a pair of images"
+        if lambda_loss > 0 and has_kpt_labels and if_warp:
             loss_desc, mask, positive_dist, negative_dist = self.descriptor_loss(
                 coarse_desc,
                 coarse_desc_warp,
@@ -315,12 +372,61 @@ class Train_model_heatmap(Train_model_frontend):
                 **self.desc_params
             )
         else:
-            ze = torch.tensor([0]).to(self.device)
+            # use a 0-dim tensor to match descriptor loss shape
+            ze = torch.tensor(0.0, device=self.device)
             loss_desc, positive_dist, negative_dist = ze, ze, ze
 
         loss = loss_det + loss_det_warp
         if lambda_loss > 0:
             loss += lambda_loss * loss_desc
+
+        seg_loss = torch.tensor(0.0, device=self.device)
+        if (
+            self.lambda_segmentation > 0
+            and seg_pred is not None
+            and sample.get("segmentation_mask") is not None
+        ):
+            # target mask provided as (H, W) long tensor
+            seg_target = sample["segmentation_mask"].long().to(self.device)
+            if seg_pred.shape[-2:] != seg_target.shape[-2:]:
+                seg_pred = F.interpolate(
+                    seg_pred,
+                    size=seg_target.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+            n_classes = seg_pred.shape[1]
+            # validate labels; see `num_segmentation_classes` config
+            assert seg_target.max() < n_classes and seg_target.min() >= 0, (
+                f"Segmentation labels must be in [0, {n_classes-1}]"
+            )
+            # convert back to float32 for loss computation when using AMP
+            seg_loss = self.seg_loss_fn(seg_pred.float(), seg_target)
+            loss += self.lambda_segmentation * seg_loss
+
+            # compute batch mean IoU when enabled
+            if self.compute_miou:
+                with torch.no_grad():
+                    pred_labels = seg_pred.argmax(dim=1)
+                    miou_scores = [
+                        compute_miou(p.cpu().numpy(), t.cpu().numpy(), num_classes=n_classes)
+                        for p, t in zip(pred_labels, seg_target)
+                    ]
+                    miou_batch = float(np.mean(miou_scores)) if miou_scores else 0.0
+                self.scalar_dict["miou"] = miou_batch
+                # also compute pixel and class accuracy
+                with torch.no_grad():
+                    p_acc = (pred_labels == seg_target).float().mean().item()
+                    class_accs = []
+                    for cls in range(n_classes):
+                        mask = (seg_target == cls)
+                        if mask.sum() == 0:
+                            continue
+                        class_accs.append((pred_labels[mask] == cls).float().mean().item())
+                    c_acc = float(np.mean(class_accs)) if class_accs else 0.0
+                self.scalar_dict["pixel_acc"] = p_acc
+                self.scalar_dict["class_acc"] = c_acc
 
         ##### try to minimize the error ######
         add_res_loss = False
@@ -357,7 +463,8 @@ class Train_model_heatmap(Train_model_frontend):
                 )
                 loss_res_warp = (outs_res_warp["loss"] ** 2).mean()
             else:
-                loss_res_warp = torch.tensor([0]).to(self.device)
+                # zero warp loss if warping is disabled
+                loss_res_warp = torch.tensor(0.0, device=self.device)
             loss_res = loss_res_ori + loss_res_warp
             # print("loss_res requires_grad: ", loss_res.requires_grad)
             loss += loss_res
@@ -374,6 +481,7 @@ class Train_model_heatmap(Train_model_frontend):
                 "loss": loss,
                 "loss_det": loss_det,
                 "loss_det_warp": loss_det_warp,
+                "seg_loss": seg_loss,
                 "positive_dist": positive_dist,
                 "negative_dist": negative_dist,
             }
@@ -382,8 +490,13 @@ class Train_model_heatmap(Train_model_frontend):
         self.input_to_imgDict(sample, self.images_dict)
 
         if train:
-            loss.backward()
-            self.optimizer.step()
+            if self.grad_scaler is not None:
+                self.grad_scaler.scale(loss).backward()
+                self.grad_scaler.step(self.optimizer)
+                self.grad_scaler.update()
+            else:
+                loss.backward()
+                self.optimizer.step()
 
         if n_iter % tb_interval == 0 or task == "val":
             logging.info(
@@ -424,40 +537,59 @@ class Train_model_heatmap(Train_model_frontend):
                 images_dict.update({name + "_nms_overlap": nms_overlap})
 
             from utils.var_dim import toNumpy
-            update_overlap(
-                self.images_dict,
-                labels_2D,
-                heatmap_org_nms_batch[np.newaxis, ...],
-                img,
-                "original",
-            )
+            if has_kpt_labels:
+                update_overlap(
+                    self.images_dict,
+                    labels_2D,
+                    heatmap_org_nms_batch[np.newaxis, ...],
+                    img,
+                    "original",
+                )
 
-            update_overlap(
-                self.images_dict,
-                labels_2D,
-                toNumpy(heatmap_org),
-                img,
-                "original_heatmap",
-            )
-            if if_warp:
                 update_overlap(
                     self.images_dict,
-                    labels_warp_2D,
-                    heatmap_warp_nms_batch[np.newaxis, ...],
-                    img_warp,
-                    "warped",
+                    labels_2D,
+                    toNumpy(heatmap_org),
+                    img,
+                    "original_heatmap",
                 )
-                update_overlap(
-                    self.images_dict,
-                    labels_warp_2D,
-                    toNumpy(heatmap_warp),
-                    img_warp,
-                    "warped_heatmap",
-                )
+                if if_warp:
+                    update_overlap(
+                        self.images_dict,
+                        labels_warp_2D,
+                        heatmap_warp_nms_batch[np.newaxis, ...],
+                        img_warp,
+                        "warped",
+                    )
+                    update_overlap(
+                        self.images_dict,
+                        labels_warp_2D,
+                        toNumpy(heatmap_warp),
+                        img_warp,
+                        "warped_heatmap",
+                    )
+
+            # visualize segmentation results if available
+            if seg_pred is not None:
+                pred_mask = seg_pred.argmax(dim=1)
+                overlays = []
+                for i in range(pred_mask.shape[0]):
+                    base_img = toNumpy(img[i].permute(1, 2, 0))
+                    overlay = overlay_mask(
+                        base_img,
+                        toNumpy(pred_mask[i]),
+                        num_classes=
+                            self.num_segmentation_classes
+                            or seg_pred.shape[1],
+                    )
+                    overlays.append(
+                        overlay.transpose(2, 0, 1).astype(np.float32) / 255.0
+                    )
+                self.images_dict["seg_overlay"] = np.stack(overlays, axis=0)
             # residuals
             from utils.losses import do_log
 
-            if self.gaussian:
+            if has_kpt_labels and self.gaussian:
                 # original: gt
                 self.get_residual_loss(
                     sample["labels_2D"],
@@ -505,12 +637,13 @@ class Train_model_heatmap(Train_model_frontend):
             #     to_floatTensor(heatmap_warp_nms_batch[:, np.newaxis, ...]),
             #     sample["warped_labels"],
             # )
-            pr_mean = self.batch_precision_recall(
-                to_floatTensor(heatmap_org_nms_batch[:, np.newaxis, ...]),
-                sample["labels_2D"],
-            )
-            print("pr_mean")
-            self.scalar_dict.update(pr_mean)
+            if has_kpt_labels:
+                pr_mean = self.batch_precision_recall(
+                    to_floatTensor(heatmap_org_nms_batch[:, np.newaxis, ...]),
+                    sample["labels_2D"],
+                )
+                print("pr_mean")
+                self.scalar_dict.update(pr_mean)
 
             self.printLosses(self.scalar_dict, task)
             self.tb_images_dict(task, self.images_dict, max_img=2)
@@ -668,7 +801,7 @@ class Train_model_heatmap(Train_model_frontend):
         pts_nms = getPtsFromHeatmap(heatmap, conf_thresh, nms_dist)
         semi_thd_nms_sample = np.zeros_like(heatmap)
         semi_thd_nms_sample[
-            pts_nms[1, :].astype(np.int), pts_nms[0, :].astype(np.int)
+            pts_nms[1, :].astype(np.int64), pts_nms[0, :].astype(np.int64)
         ] = 1
         return semi_thd_nms_sample
 

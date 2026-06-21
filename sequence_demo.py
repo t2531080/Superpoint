@@ -1,0 +1,235 @@
+"""Demo script to export matches between each Cityscapes frame and its homography-warped view."""
+
+from pathlib import Path
+import yaml
+import torch
+import numpy as np
+import cv2
+
+from Val_model_heatmap import Val_model_heatmap
+# import metrics utilities for visualization
+from evaluation import overlay_mask, draw_matches_cv, compute_miou, compute_repeatability, draw_metrics_box, smooth_mask
+from utils.cityscapes_camera import (
+    load_cityscapes_camera,
+    simulate_ego_motion,
+    compute_homography,
+)  # import helpers to compute homographies
+
+
+def nn_match_two_way(desc1: np.ndarray, desc2: np.ndarray, nn_thresh: float) -> np.ndarray:
+    """Two-way nearest-neighbor matching for unit-normalized descriptors."""
+    assert desc1.shape[0] == desc2.shape[0]
+    if desc1.shape[1] == 0 or desc2.shape[1] == 0:
+        return np.zeros((3, 0))
+    if nn_thresh < 0.0:
+        raise ValueError("'nn_thresh' should be non-negative")
+    dmat = np.dot(desc1.T, desc2)
+    dmat = np.sqrt(2 - 2 * np.clip(dmat, -1, 1))
+    idx = np.argmin(dmat, axis=1)
+    scores = dmat[np.arange(dmat.shape[0]), idx]
+    keep = scores < nn_thresh
+    idx2 = np.argmin(dmat, axis=0)
+    keep_bi = np.arange(len(idx)) == idx2[idx]
+    keep = np.logical_and(keep, keep_bi)
+    idx = idx[keep]
+    scores = scores[keep]
+    m_idx1 = np.arange(desc1.shape[1])[keep]
+    m_idx2 = idx
+    matches = np.zeros((3, int(keep.sum())))
+    matches[0, :] = m_idx1
+    matches[1, :] = m_idx2
+    matches[2, :] = scores
+    return matches
+
+
+def main():
+    # Iterate over every sequence (city) in the training split.
+    train_root = Path("datasets/Cityscapes/rightImg8bit/train")
+    if not train_root.exists():
+        raise RuntimeError(f"Training directory {train_root} does not exist")
+
+    # Load model configuration and weights once.
+    with open("configs/superpoint_cityscapes_export.yaml", "r") as f:
+        config = yaml.safe_load(f)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    val_agent = Val_model_heatmap(config["model"], device=device)
+    val_agent.loadModel()
+
+    resize = config["data"]["preprocessing"]["resize"]  # model expects this size.
+
+    # Visualization controls for draw_matches_cv.
+    draw_keypoints = True  # draw only match lines if False
+    point_color = (0, 255, 0)  # BGR color for keypoints when drawn
+    point_radius = 2  # radius for keypoint circles
+
+    def load_frame(p: Path) -> np.ndarray:
+        """Read and resize a grayscale frame to the model input size."""
+        img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+        return cv2.resize(img, (resize[1], resize[0]), interpolation=cv2.INTER_AREA)
+
+    out_root = Path("sequence_demo_output")
+    out_root.mkdir(exist_ok=True)
+
+    # Expected location of homography matrices (one per frame).
+    homography_root = Path("datasets/Cityscapes/homographies/train")
+
+    # Loop over all sequence directories such as 'aachen', 'bochum', ...
+    for seq_dir in sorted(train_root.iterdir()):
+        if not seq_dir.is_dir():
+            continue
+        image_paths = sorted(seq_dir.glob("*.png"))
+        if not image_paths:
+            continue
+
+        # Create a mirrored output directory for this sequence.
+        seq_out = out_root / seq_dir.name
+        seq_out.mkdir(parents=True, exist_ok=True)
+
+        for img_path in image_paths:
+            # Pair each frame with its homography-warped counterpart; no temporal loop.
+            H_path = homography_root / seq_dir.name / f"{img_path.stem}.npy"
+            if not H_path.exists():
+                cam_json = Path("datasets/Cityscapes/camera/train") / seq_dir.name / f"{img_path.stem}_camera.json"
+                if not cam_json.exists():
+                    print(f"Missing homography and camera for {img_path}, skipping")
+                    continue
+                K, R_cam, t_cam = load_cityscapes_camera(cam_json)  # load parameters
+                original_width, original_height = 2048, 1024
+                scale_x = resize[1] / original_width
+                scale_y = resize[0] / original_height
+                K[0, :] *= scale_x  # scale intrinsics for resized images
+                K[1, :] *= scale_y
+                R_delta, t_delta = simulate_ego_motion()  # simulate motion
+                R_warped = R_delta @ R_cam
+                t_warped = t_cam + t_delta
+                H = compute_homography(K, R_cam, t_cam, R_warped, t_warped)  # compute homography
+                H_path.parent.mkdir(parents=True, exist_ok=True)
+                np.save(H_path, H)  # write homography for future runs
+            else:
+                H = np.load(str(H_path))
+
+            img0_raw = load_frame(img_path)
+            img1_raw = cv2.warpPerspective(img0_raw, H, (img0_raw.shape[1], img0_raw.shape[0]))
+
+            img0 = torch.from_numpy(img0_raw.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0).to(device)
+            img1 = torch.from_numpy(img1_raw.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0).to(device)
+
+            # Compute descriptors for the frame and its warp (segmentation predicted only once).
+            val_agent.run(img0)
+            pts0 = val_agent.heatmap_to_pts()[0]
+            desc0 = val_agent.desc_to_sparseDesc()[0]
+            seg0 = None
+            seg1 = None
+            if "segmentation" in val_agent.outs:
+                seg0 = val_agent.outs["segmentation"].argmax(dim=1).cpu().numpy()[0]
+                seg0 = smooth_mask(seg0)  # denoise prediction before warping
+                # warp seg0 using ground-truth homography instead of re-inference
+                seg1 = cv2.warpPerspective(seg0, H, (seg0.shape[1], seg0.shape[0]),
+                                           flags=cv2.INTER_NEAREST)
+
+            val_agent.run(img1)
+            pts1 = val_agent.heatmap_to_pts()[0]
+            desc1 = val_agent.desc_to_sparseDesc()[0]
+
+            # Perform two-way nearest-neighbor matching without tracking.
+            matches = nn_match_two_way(desc0, desc1, val_agent.nn_thresh).T
+            kpts1 = pts0[[1, 0], :].T
+            kpts2 = pts1[[1, 0], :].T
+
+            if matches.size == 0:
+                print(f"No matches for {img_path.stem} in {seq_dir.name}, writing placeholder")
+                coords = np.zeros((0, 4), dtype=int)
+                inliers = np.zeros(0, dtype=bool)
+                cv2_matches = []
+            else:
+                cv2_matches = [
+                    cv2.DMatch(int(m[0]), int(m[1]), float(m[2])) for m in matches
+                ]
+                inliers = np.ones(matches.shape[0], dtype=bool)
+                # pts0 and pts1 are in (row, col) order
+                # pts0/pts1 are returned in (x, y) order; split into columns/rows accordingly
+                cols0 = pts0[0, matches[:, 0].astype(int)].astype(int)  # x coordinates in image0
+                rows0 = pts0[1, matches[:, 0].astype(int)].astype(int)  # y coordinates in image0
+                cols1 = pts1[0, matches[:, 1].astype(int)].astype(int)  # x coordinates in image1
+                rows1 = pts1[1, matches[:, 1].astype(int)].astype(int)  # y coordinates in image1
+                if seg0 is not None and seg1 is not None:
+                    # clip coordinates to image bounds before indexing
+                    rows0 = np.clip(rows0, 0, seg0.shape[0] - 1)
+                    cols0 = np.clip(cols0, 0, seg0.shape[1] - 1)
+                    rows1 = np.clip(rows1, 0, seg1.shape[0] - 1)
+                    cols1 = np.clip(cols1, 0, seg1.shape[1] - 1)
+                    # filter matches to static/flat classes from both predictions
+                    stable = np.isin(seg0[rows0, cols0], [0, 1]) & \
+                             np.isin(seg1[rows1, cols1], [0, 1])
+                    # retain only matches on stable classes
+                    rows0, cols0, rows1, cols1 = (
+                        a[stable] for a in (rows0, cols0, rows1, cols1)
+                    )
+                    inliers = inliers[stable]
+                    debug_idx = np.random.choice(rows0.shape[0], size=min(20, rows0.shape[0]), replace=False)
+                    print("debugging_class", np.unique(seg0[rows0[debug_idx], cols0[debug_idx]]))
+                    cv2_matches = [m for m, keep in zip(cv2_matches, stable) if keep]
+                    
+                    
+                # finally pack the surviving coordinates in (x, y) order for OpenCV
+                coords = np.column_stack([cols0, rows0, cols1, rows1]).astype(int)
+                if coords.size == 0:
+                    print(f"All matches filtered for {img_path.stem} in {seq_dir.name}")
+                    inliers = np.zeros(0, dtype=bool)
+                    cv2_matches = []
+            # Overlay masks for visualization.
+            img0_vis = overlay_mask(img0_raw, seg0) if seg0 is not None else img0_raw
+            img1_vis = overlay_mask(img1_raw, seg1) if seg1 is not None else img1_raw
+
+            data = {
+                "image1": img0_vis,
+                "image2": img1_vis,
+                "keypoints1": kpts1,
+                "keypoints2": kpts2,
+                "matches": coords,
+                "inliers": inliers,
+                "homography": H,  # store ground-truth homography in output
+            }
+
+            match_img = draw_matches_cv(
+                data,
+                cv2_matches,
+                draw_keypoints=draw_keypoints,
+                point_color=point_color,
+                point_radius=point_radius,
+            )
+            # Compute per-frame metrics for overlay
+            kp_count = pts0.shape[1]  # total keypoints in reference frame
+            match_score = inliers.sum() / max(kp_count, 1)  # ratio of valid matches to total keypoints
+            miou = (
+                compute_miou(seg0, seg1) if seg0 is not None and seg1 is not None else 0.0
+            )  # mIoU between original prediction and its homography warp
+            if kpts1.size and kpts2.size:
+                rep_data = {
+                    "prob": np.hstack([kpts1, np.ones((kpts1.shape[0], 1))]),
+                    "warped_prob": np.hstack([kpts2, np.ones((kpts2.shape[0], 1))]),
+                    "image": img0_raw,
+                    "homography": H,
+                }
+                repeatability, _ = compute_repeatability(
+                    rep_data, keep_k_points=300, distance_thresh=3, verbose=False
+                )  # repeatability relative to homography-warped view
+            else:
+                repeatability = 0.0
+
+            metrics = {
+                "Keypoints": kp_count,
+                "Matching Score": f"{match_score:.6f}",
+                "mIoU": f"{miou:.6f}",
+                "Repeatability": f"{repeatability:.6f}",
+            }
+            # place metrics box in the upper-right corner for visibility
+            match_img = draw_metrics_box(match_img, metrics, position="top-right")
+
+            # Save visualization with metrics
+            cv2.imwrite(str(seq_out / f"{img_path.stem}_matches.png"), match_img)
+            np.savez(seq_out / f"{img_path.stem}_matches.npz", **data)
+
+
+if __name__ == "__main__":
+    main()
